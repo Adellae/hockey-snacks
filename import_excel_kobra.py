@@ -8,13 +8,16 @@ import pandas as pd
 from db import get_connection
 
 TEAM_NAME = "HC Kobra Praha ženy"
+TOURNAMENT = "Turnaj"
 EXCLUDE_TRAININGS = True  # ignore columns containing "Trénink"
 
 
 def is_match_column(col_name: str) -> bool:
-    """Return True if the column header represents a match involving TEAM_NAME."""
+    """Return True if the column header represents a match involving TEAM_NAME or TOURNAMENT."""
     if not isinstance(col_name, str):
         return False
+    if TOURNAMENT in col_name:
+        return True
     if TEAM_NAME not in col_name:
         return False
     if EXCLUDE_TRAININGS and "Trénink" in col_name:
