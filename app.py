@@ -1,56 +1,94 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime
+import os
 
-from db import get_connection, init_db
-from logic import (
-    preview_snack_pair,
-    assign_snack_pair,
+import streamlit as st
+
+
+def _bootstrap_env() -> None:
+    """Secrets ze Streamlitu do env, aby db.py nemusel znát Streamlit.
+
+    Musí proběhnout dřív, než se sáhne na connection pool.
+    """
+    for key in (
+        "DATABASE_URL",
+        "TYMUJ_EMAIL",
+        "TYMUJ_PASSWORD",
+        "TYMUJ_TEAM_ID",
+        "ADMIN_PASSWORD",
+        "VIEWER_PASSWORD",
+    ):
+        try:
+            if key in st.secrets:
+                os.environ.setdefault(key, str(st.secrets[key]))
+        except FileNotFoundError:
+            pass  # lokální běh bez secrets.toml — env je nastavené z .env
+
+
+_bootstrap_env()
+
+import hmac  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+import pandas as pd  # noqa: E402
+
+from snacks.config import (  # noqa: E402
+    ELIGIBLE_SQL,
+    EXCLUDED_PARAM,
+    FAIRNESS_ORDER,
+    LOCAL_TZ,
+    NAME_COLLATION,
+    TARGET_SNACK_COUNT,
+)
+from snacks.db import get_conn, init_db  # noqa: E402
+from snacks.ingest import last_run, run_ingest  # noqa: E402
+from snacks.logic import (  # noqa: E402
+    assign_single_person,
     get_assigned_for_match,
     unassign_snack,
-    assign_single_person,
 )
+from snacks.tymuj import TymujNotConfigured  # noqa: E402
 
-EXCLUDED_GROUPS = ("Trenéři", "Neaktivní")
+EXCLUDED = EXCLUDED_PARAM
+
+
+def fmt(dt: datetime | None, with_time: bool = True) -> str:
+    if dt is None:
+        return "—"
+    local = dt.astimezone(LOCAL_TZ)
+    return local.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y")
+
 
 # -----------------------------
 # Přihlášení / role
 # -----------------------------
 def require_role() -> str:
-    """
-    Jednoduché role přes Streamlit secrets.
-    Vytvoř .streamlit/secrets.toml s:
-      ADMIN_PASSWORD = "..."
-      VIEWER_PASSWORD = "..."
-    """
     if "role" not in st.session_state:
         st.session_state.role = None
 
     st.sidebar.header("🔐 Přístup")
 
-    # Už přihlášen(a)
     if st.session_state.role in ("admin", "viewer"):
-        role_label = "Správce" if st.session_state.role == "admin" else "Hráčka"
-        st.sidebar.success(f"Přihlášen/a jako: {role_label}")
+        label = "Správce" if st.session_state.role == "admin" else "Hráčka"
+        st.sidebar.success(f"Přihlášen/a jako: {label}")
         if st.sidebar.button("Odhlásit se"):
             st.session_state.role = None
             st.rerun()
         return st.session_state.role
 
-    role_choice_ui = st.sidebar.selectbox("Role", ["Hráčka", "Správce"])
+    role_ui = st.sidebar.selectbox("Role", ["Hráčka", "Správce"])
     password = st.sidebar.text_input("Heslo", type="password")
 
     if st.sidebar.button("Přihlásit se"):
-        viewer_pw = st.secrets.get("VIEWER_PASSWORD", "")
-        admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
+        role = "viewer" if role_ui == "Hráčka" else "admin"
+        expected = os.environ.get(
+            "VIEWER_PASSWORD" if role == "viewer" else "ADMIN_PASSWORD", ""
+        )
 
-        role_choice = "viewer" if role_choice_ui == "Hráčka" else "admin"
-
-        if role_choice == "viewer" and password == viewer_pw:
-            st.session_state.role = "viewer"
-            st.rerun()
-        elif role_choice == "admin" and password == admin_pw:
-            st.session_state.role = "admin"
+        # Fail closed: bez nastaveného hesla se nedá přihlásit vůbec.
+        # Dřív tu byl default "", takže prázdné heslo prošlo.
+        if not expected:
+            st.sidebar.error("Heslo pro tuhle roli není na serveru nastavené.")
+        elif hmac.compare_digest(password, expected):
+            st.session_state.role = role
             st.rerun()
         else:
             st.sidebar.error("Špatné heslo.")
@@ -62,81 +100,167 @@ def require_role() -> str:
 # Načítání dat
 # -----------------------------
 def load_snack_overview() -> pd.DataFrame:
-    """
-    Přehled svačinek (bez trenérů/neaktivních).
-    Řazení: snacks_done ASC, last_snack_datetime ASC (nejstarší nahoře), jméno ASC.
-    Hráčky, které nikdy nenosily, jsou nahoře.
-    """
-    conn = get_connection()
-    df = pd.read_sql_query(
-        f"""
-        SELECT
-            p.name AS player_name,
-            COUNT(sa.id) AS snacks_done,
-            MAX(m.match_datetime) AS last_snack_datetime
-        FROM players p
-        LEFT JOIN snack_assignments sa ON sa.player_id = p.id
-        LEFT JOIN matches m ON m.id = sa.match_id
-        WHERE COALESCE(p.group_name, '') NOT IN ({",".join(["?"] * len(EXCLUDED_GROUPS))})
-        GROUP BY p.id
-        """,
-        conn,
-        params=list(EXCLUDED_GROUPS),
-    )
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT p.name AS player_name,
+                   COUNT(m.id) AS snacks_done,
+                   MAX(m.match_datetime) AS last_snack
+            FROM players p
+            LEFT JOIN snack_assignments sa ON sa.player_id = p.id
+            LEFT JOIN matches m ON m.id = sa.match_id AND m.status = 'active'
+            WHERE {ELIGIBLE_SQL}
+            GROUP BY p.id, p.name
+            ORDER BY {FAIRNESS_ORDER}
+            """,
+            (EXCLUDED,),
+        ).fetchall()
 
-    df["last_snack_datetime"] = pd.to_datetime(df["last_snack_datetime"])
-    df = df.sort_values(
-        by=["snacks_done", "last_snack_datetime", "player_name"],
-        ascending=[True, True, True],
-        na_position="first",
+    return pd.DataFrame(
+        [
+            {
+                "Jméno": r["player_name"],
+                "Počet svačinek": r["snacks_done"],
+                "Datum poslední svačinky": fmt(r["last_snack"], with_time=False),
+            }
+            for r in rows
+        ]
     )
-    df["last_snack_date"] = df["last_snack_datetime"].dt.date
-    df = df[["player_name", "snacks_done", "last_snack_date"]]
-    df = df.rename(
-        columns={
-            "player_name": "Jméno",
-            "snacks_done": "Počet svačinek",
-            "last_snack_date": "Datum poslední svačinky",
-        }
-    )
-    return df
 
 
 def load_upcoming_matches():
-    """Jen nadcházející zápasy (match_datetime >= teď)."""
-    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    conn = get_connection()
-    matches = conn.execute(
-        """
-        SELECT id, match_datetime, opponent
-        FROM matches
-        WHERE match_datetime >= ?
-        ORDER BY match_datetime
-        """,
-        (now_iso,),
-    ).fetchall()
-    conn.close()
-    return matches
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT id, match_datetime, opponent
+            FROM matches
+            WHERE match_datetime >= now() AND status = 'active'
+            ORDER BY match_datetime
+            """
+        ).fetchall()
 
 
 def load_registrations(match_id: int):
-    """Přihlášené hráčky na zápas (bez trenérů/neaktivních)."""
-    conn = get_connection()
-    regs = conn.execute(
-        f"""
-        SELECT p.id, p.name
-        FROM registrations r
-        JOIN players p ON p.id = r.player_id
-        WHERE r.match_id = ?
-          AND COALESCE(p.group_name, '') NOT IN ({",".join(["?"] * len(EXCLUDED_GROUPS))})
-        ORDER BY p.name
-        """,
-        (match_id, *EXCLUDED_GROUPS),
-    ).fetchall()
-    conn.close()
-    return regs
+    with get_conn() as conn:
+        return conn.execute(
+            f"""
+            SELECT p.id, p.name
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.match_id = %s AND {ELIGIBLE_SQL}
+            ORDER BY p.name COLLATE "{NAME_COLLATION}"
+            """,
+            (match_id, EXCLUDED),
+        ).fetchall()
+
+
+def load_match_queue(match_id: int) -> pd.DataFrame:
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT p.name AS player_name,
+                   COUNT(m_all.id) AS snacks_done,
+                   MAX(m_all.match_datetime) AS last_snack,
+                   bool_or(sa_match.id IS NOT NULL) AS is_assigned
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            LEFT JOIN snack_assignments sa_all ON sa_all.player_id = p.id
+            LEFT JOIN matches m_all
+                   ON m_all.id = sa_all.match_id AND m_all.status = 'active'
+            LEFT JOIN snack_assignments sa_match
+                   ON sa_match.player_id = p.id AND sa_match.match_id = %s
+            WHERE r.match_id = %s AND {ELIGIBLE_SQL}
+            GROUP BY p.id, p.name
+            ORDER BY is_assigned ASC, {FAIRNESS_ORDER}
+            """,
+            (match_id, match_id, EXCLUDED),
+        ).fetchall()
+
+    return pd.DataFrame(
+        [
+            {
+                "Pořadí": i + 1,
+                "Jméno": r["player_name"],
+                "Počet svačinek": r["snacks_done"],
+                "Datum poslední svačinky": fmt(r["last_snack"], with_time=False),
+                "Už přiřazena": "Ano" if r["is_assigned"] else "Ne",
+            }
+            for i, r in enumerate(rows)
+        ]
+    )
+
+
+# -----------------------------
+# Administrace importu
+# -----------------------------
+def _show_import_result(stats) -> None:
+    st.success(f"Hotovo — {stats.summary()}")
+    for c in stats.cancelled:
+        st.warning(f"Zrušeno/přesunuto: {c}")
+
+    for change in getattr(stats, "autofill", []):
+        lines = [f"**{change['match']}**"]
+        if change["removed"]:
+            lines.append(f"odhlásily se: {', '.join(change['removed'])}")
+        if change["added"]:
+            lines.append(f"nově na svačinky: {', '.join(change['added'])}")
+        st.info("  \n".join(lines))
+
+    ignored = getattr(stats, "ignored_headers", None)
+    if ignored:
+        # Kontrola pro případ, že se v Týmuj zas změní pojmenování zápasů.
+        with st.expander(f"Sloupce vyhodnocené jako „není zápas“ ({len(ignored)})"):
+            for h in ignored:
+                st.write(f"- {h}")
+
+
+def render_import_admin() -> None:
+    st.subheader("🔄 Import dat z Týmuj")
+
+    with get_conn() as conn:
+        run = last_run(conn)
+
+    if run is None:
+        st.info("Zatím neproběhl žádný import.")
+    else:
+        when = fmt(run["started_at"])
+        if run["status"] == "ok":
+            st.success(f"Poslední import: {when} ({run['source']}) — {run['message']}")
+        elif run["status"] == "running":
+            st.warning(f"Import běží od {when} ({run['source']}).")
+        else:
+            st.error(
+                f"Poslední import selhal: {when} ({run['source']}) — {run['message']}"
+            )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.caption("Stejný import, jaký běží každý den automaticky.")
+        if st.button("▶️ Stáhnout z Týmuj teď", use_container_width=True):
+            with st.spinner("Stahuju z Týmuj a importuju…"):
+                try:
+                    stats = run_ingest(source="manual")
+                except TymujNotConfigured as exc:
+                    st.warning(str(exc))
+                except Exception as exc:
+                    st.error(f"Import selhal: {exc}")
+                else:
+                    _show_import_result(stats)
+
+    with col2:
+        st.caption("Záloha, když je Týmuj nedostupný.")
+        uploaded = st.file_uploader("Nahraj export ručně", type=["xlsx", "xls"])
+        if uploaded is not None and st.button(
+            "Naimportovat soubor", use_container_width=True
+        ):
+            with st.spinner("Importuju…"):
+                try:
+                    stats = run_ingest(source="upload", data=uploaded.getvalue())
+                except Exception as exc:
+                    st.error(f"Import selhal: {exc}")
+                else:
+                    _show_import_result(stats)
 
 
 # -----------------------------
@@ -149,134 +273,139 @@ def main():
     init_db()
     role = require_role()
 
-    # -----------------------------
-    # Hráčka/Správce: přehled svačinek
-    # -----------------------------
     st.header("🥨 Přehled svačinek")
-    st.caption("Nahoře jsou hráčky, které jsou nejvíc „na řadě“ (nikdy nenosily nebo nosily dávno).")
-    st.caption("Trenéři a neaktivní jsou vyloučení.")
-    overview = load_snack_overview()
-    st.dataframe(overview, hide_index=True)
+    st.caption(
+        "Nahoře jsou hráčky, které jsou nejvíc na řadě "
+        "(nikdy nepřinesly nebo přinesly dávno)."
+    )
+    st.caption("Trenéři a neaktivní jsou vyloučení. Zrušené zápasy se nepočítají.")
+    st.dataframe(load_snack_overview(), hide_index=True)
 
     st.divider()
-
-    # -----------------------------
-    # Hráčka/Správce: zobrazení přiřazení pro nadcházející zápasy
-    # -----------------------------
-    st.header("📅 Svačinky na nadcházející zápasy (zobrazení)")
+    st.header("📅 Svačinky na nadcházející zápasy")
 
     matches = load_upcoming_matches()
     if not matches:
-        st.info("Nebyly nalezeny žádné nadcházející zápasy. Nejdřív naimportuj export.")
+        st.info("Žádné nadcházející zápasy. Naimportuj aktuální export z Týmuj.")
+        if role == "admin":
+            st.divider()
+            st.header("🛠️ Správce")
+            render_import_admin()
         return
 
-    match_display = [f"{m['match_datetime']} — {m['opponent']}" for m in matches]
-    idx = st.selectbox("Vyber zápas", range(len(matches)), format_func=lambda i: match_display[i])
+    display = [f"{fmt(m['match_datetime'])} — {m['opponent']}" for m in matches]
+    idx = st.selectbox(
+        "Vyber zápas", range(len(matches)), format_func=lambda i: display[i]
+    )
     match = matches[idx]
 
     assigned = get_assigned_for_match(match["id"])
 
+    st.subheader("Aktuálně přiřazené svačinky")
     if not assigned:
         st.info("Na tento zápas zatím nejsou přiřazené svačinky.")
     else:
-        assigned_df = pd.DataFrame(
-            [
-                {
-                    "Hráčka": a["player_name"],
-                    "Dobrovolník": bool(a["is_volunteer"]),
-                    "Přiřazeno": a["assigned_at"],
-                }
-                for a in assigned
-            ]
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Hráčka": a["player_name"],
+                        "Dobrovolník": bool(a["is_volunteer"]),
+                        "Přiřazeno": fmt(a["assigned_at"]),
+                    }
+                    for a in assigned
+                ]
+            ),
+            hide_index=True,
         )
-        st.dataframe(assigned_df, hide_index=True)
 
-    # Hráčka končí tady
+    st.divider()
+    st.subheader("📋 Pořadí pro vybraný zápas")
+    st.caption(
+        "Jen přihlášené hráčky na vybraný zápas, řazené stejnou logikou jako návrh. "
+        "Když někdo odpadne, další nepřiřazená hráčka nahoře je na řadě."
+    )
+
+    queue = load_match_queue(match["id"])
+    if queue.empty:
+        st.info("Na tento zápas nejsou žádné způsobilé přihlášené hráčky.")
+    else:
+        st.dataframe(queue, hide_index=True)
+
     if role != "admin":
         return
 
-    # -----------------------------
-    # Správce: správa přiřazení
-    # -----------------------------
     st.divider()
-    st.header("🛠️ Správce: správa svačinek")
+    st.header("🛠️ Správce")
+    render_assignment_admin(match, assigned)
+
+    # Import je až úplně dole — používá se zřídka a nemá odtlačovat
+    # přiřazování svačinek, kvůli kterému sem správce chodí.
+    st.divider()
+    render_import_admin()
+
+
+def render_assignment_admin(match, assigned) -> None:
+    st.caption(
+        f"Svačinky přiřazuje algoritmus sám při každém importu — doplní zápas "
+        f"na {TARGET_SNACK_COUNT} hráčky podle pořadí a kdo se ze zápasu "
+        f"odhlásí, toho nahradí další v pořadí. Ruční přidání a odebrání níž "
+        f"je pro případ, že se někdo chce na svačinky přihlásit dobrovolně."
+    )
+    if len(assigned) >= TARGET_SNACK_COUNT:
+        st.info(
+            f"Na tenhle zápas už jsou přiřazené {len(assigned)} hráčky, "
+            "takže do něj algoritmus nezasahuje."
+        )
 
     regs = load_registrations(match["id"])
     if not regs:
-        st.warning("Žádné způsobilé přihlášené hráčky (po vyloučení trenérů/neaktivních).")
+        st.warning("Žádné způsobilé přihlášené hráčky.")
         return
 
     name_to_id = {r["name"]: r["id"] for r in regs}
-    assigned_player_ids = {a["player_id"] for a in assigned}
+    assigned_ids = {a["player_id"] for a in assigned}
 
-    # --- Odebrání přiřazení ---
+    st.subheader("➕ Přidat hráčku (dobrovolnice)")
+
+    eligible = [r["name"] for r in regs if r["id"] not in assigned_ids]
+    if not eligible:
+        st.info("Nezbývá žádná způsobilá přihlášená hráčka.")
+    else:
+        st.caption(
+            "Nabízí se jen hráčky přihlášené na tenhle zápas. Kdo na zápas "
+            "nejede, se na svačinky přiřadit nedá — a kdyby se odhlásila "
+            "později, algoritmus ji odebere a doplní další v pořadí."
+        )
+        single = st.selectbox("Vyber hráčku", eligible)
+        is_vol = st.checkbox("Označit jako dobrovolnici", value=True)
+        if st.button("Přidat na svačinky"):
+            if assign_single_person(match["id"], name_to_id[single], is_vol):
+                st.success(f"Přiřazeno: {single}.")
+            else:
+                st.warning(f"{single} už je přiřazen(a).")
+            st.rerun()
+
+    st.divider()
     st.subheader("🗑️ Odebrat přiřazení")
+
     if not assigned:
         st.info("Není co odebrat.")
     else:
-        delete_options = {
-            f"{a['player_name']} (přiřazeno {a['assigned_at']})": a["assignment_id"]
+        options = {
+            f"{a['player_name']}"
+            f"{' — dobrovolnice' if a['is_volunteer'] else ''}"
+            f" (přiřazeno {fmt(a['assigned_at'])})": a["assignment_id"]
             for a in assigned
         }
-        to_delete_label = st.selectbox("Vyber přiřazení k odebrání", list(delete_options.keys()))
+        label = st.selectbox("Vyber přiřazení k odebrání", list(options.keys()))
+        st.caption(
+            "Uvolněné místo doplní algoritmus při dalším importu — "
+            "nebo rovnou přidej náhradu ručně výš."
+        )
         if st.button("Odebrat vybranou hráčku"):
-            unassign_snack(delete_options[to_delete_label])
+            unassign_snack(options[label])
             st.success("Přiřazení bylo odebráno.")
-            st.rerun()
-
-    st.divider()
-
-    # --- Návrh dvojice ---
-    st.subheader("🤝 Navrhnout dvojici na svačinky")
-
-    volunteer_names = st.multiselect(
-        "Dobrovolníci (volitelné)",
-        options=[r["name"] for r in regs if r["id"] not in assigned_player_ids],
-    )
-    volunteer_ids = [name_to_id[n] for n in volunteer_names]
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Náhled návrhu dvojice"):
-            chosen = preview_snack_pair(match["id"], volunteer_ids=volunteer_ids)
-            if len(chosen) < 2:
-                st.warning("Je k dispozici méně než 2 způsobilé hráčky.")
-            st.write("Navržená dvojice:")
-            for r in chosen:
-                st.write(f"- {r['name']}")
-
-    with col2:
-        if st.button("Přiřadit navrženou dvojici (uložit)"):
-            chosen = assign_snack_pair(match["id"], volunteer_ids=volunteer_ids)
-            st.success("Přiřazení svačinek uloženo ✅")
-            for r in chosen:
-                st.write(f"- {r['name']}")
-            st.rerun()
-
-    st.divider()
-
-    # --- Ruční přiřazení jedné hráčky ---
-    st.subheader("➕ Ruční přiřazení (jedna hráčka)")
-
-    eligible = [r for r in regs if r["id"] not in assigned_player_ids]
-    eligible_names = [r["name"] for r in eligible]
-
-    if not eligible_names:
-        st.info("Nezbývá žádná způsobilá přihlášená hráčka k přiřazení.")
-    else:
-        single_name = st.selectbox("Vyber hráčku", eligible_names)
-        single_is_volunteer = st.checkbox("Označit jako dobrovolníka", value=False)
-
-        if st.button("Přidat tuto hráčku na svačinky"):
-            ok = assign_single_person(
-                match_id=match["id"],
-                player_id=name_to_id[single_name],
-                is_volunteer=single_is_volunteer,
-            )
-            if ok:
-                st.success(f"Přiřazeno: {single_name}.")
-            else:
-                st.warning(f"{single_name} už je přiřazen(a).")
             st.rerun()
 
 

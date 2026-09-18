@@ -1,6 +1,13 @@
 venv/
 __pycache__/
 *.pyc
-snacks.db
+
+# Tajné hodnoty. .env.example je naopak verzovaný.
+.env
 .streamlit/secrets.toml
-attendance_export.xlsx
+
+# Editor
+.vscode/
+
+# Stažené exporty se nikam neukládají, importují se rovnou do DB.
+attendance_export*.xlsx
