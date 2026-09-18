@@ -19,8 +19,13 @@ def _bootstrap_env() -> None:
         try:
             if key in st.secrets:
                 os.environ.setdefault(key, str(st.secrets[key]))
-        except FileNotFoundError:
-            pass  # lokální běh bez secrets.toml — env je nastavené z .env
+        except Exception:
+            # Streamlit hlásí chybějící secrets různě podle verze
+            # (FileNotFoundError, dnes StreamlitSecretNotFoundError), a lokálně
+            # soubor se secrets vůbec nemusí být. Čtení nepovinných secrets
+            # nesmí shodit aplikaci — chybějící hodnota se pozná až tam,
+            # kde je potřeba, a s konkrétní hláškou.
+            pass
 
 
 _bootstrap_env()

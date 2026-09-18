@@ -20,8 +20,13 @@ def get_database_url() -> str:
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         raise RuntimeError(
-            "DATABASE_URL není nastavená. Lokálně ji dej do .env, "
-            "ve Streamlit Cloud do secrets, v GitHub Actions do secrets."
+            "DATABASE_URL není nastavená.\n"
+            "  * Streamlit Cloud: Manage app -> Settings -> Secrets "
+            "(pozor, to je jiné úložiště než secrets na GitHubu)\n"
+            "  * GitHub Actions: Settings -> Secrets and variables -> Actions\n"
+            "  * lokálně: soubor .env v kořeni projektu\n"
+            "Hodnota je connection string ze Supabase -> Connect -> "
+            "Session pooler (port 5432)."
         )
     return url
 
